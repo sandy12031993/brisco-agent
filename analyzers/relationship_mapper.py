@@ -15,6 +15,9 @@ import json
 from pathlib import Path
 from typing import Dict, List, Any, Set, Tuple, Optional
 from dataclasses import dataclass, field, asdict
+from .route_parser import RouteParser
+from .js_route_parser import JSRouteParser
+from .vue_parser import VueParser
 
 
 @dataclass
@@ -50,6 +53,11 @@ class RelationshipMapper:
         self.legacy_root = self.project_root / "core"
         self.laravel_root = self.project_root / "laravel"
 
+        # Initialize parsers
+        self.route_parser = RouteParser(str(self.laravel_root))
+        self.js_route_parser = JSRouteParser(str(self.laravel_root))
+        self.vue_parser = VueParser()
+
     def analyze_php_legacy(self, file_path: str, depth: int = 3) -> RelationshipGraph:
         """Analyze a legacy PHP file and its relationships.
 
@@ -68,12 +76,26 @@ class RelationshipMapper:
         return graph
 
     def _analyze_php_file_recursive(self, file_path: str, graph: RelationshipGraph,
-                                    visited: Set[str], depth: int):
-        """Recursively analyze PHP file relationships."""
+                                    visited: Set[str], depth: int, parsed_functions: Optional[Set[str]] = None,
+                                    is_entry_point: bool = True):
+        """Recursively analyze PHP file relationships.
+
+        Args:
+            file_path: Path to the PHP file to analyze
+            graph: The relationship graph to populate
+            visited: Set of already visited files
+            depth: How many levels deep to recurse
+            parsed_functions: Set of already parsed functions (for deduplication)
+            is_entry_point: True if this is the main file being analyzed, False if included
+        """
         if depth <= 0 or file_path in visited:
             return
 
         visited.add(file_path)
+
+        # Initialize parsed_functions set for deduplication
+        if parsed_functions is None:
+            parsed_functions = set()
 
         # Add node
         graph.nodes[file_path] = {
@@ -82,7 +104,7 @@ class RelationshipMapper:
             "analyzed": True
         }
 
-        if file_path not in graph.entry_points:
+        if file_path not in graph.entry_points and is_entry_point:
             graph.entry_points.append(file_path)
 
         # Read file content
@@ -94,6 +116,19 @@ class RelationshipMapper:
             graph.nodes[file_path]["error"] = str(e)
             return
 
+        # ONLY extract tables from entry point files, NOT from included library files
+        # Entry point files contain the actual application logic with table references
+        # Included files (functions.php, config.php, etc.) typically have reusable
+        # functions with parameters, not hardcoded table names
+        if is_entry_point:
+            # Find database tables directly in THIS file only
+            # This will include:
+            # - Direct SQL queries (FROM, JOIN, UPDATE, INTO)
+            # - DB::table() calls
+            # - add_row('table_name') calls where table name is in the call
+            tables = self._find_database_tables(content)
+            graph.database_tables.update(tables)
+
         # Find includes/requires
         includes = self._find_php_includes(content, file_path)
         for include_file, line_num in includes:
@@ -103,7 +138,9 @@ class RelationshipMapper:
                 relationship_type="include",
                 line_number=line_num
             ))
-            self._analyze_php_file_recursive(include_file, graph, visited, depth - 1)
+            # Continue recursion to map includes, but mark as NOT entry point
+            self._analyze_php_file_recursive(include_file, graph, visited, depth - 1,
+                                            parsed_functions, is_entry_point=False)
 
         # Find AJAX endpoints
         ajax_calls = self._find_ajax_calls(content, file_path)
@@ -115,7 +152,9 @@ class RelationshipMapper:
                 line_number=line_num,
                 context=method
             ))
-            self._analyze_php_file_recursive(endpoint, graph, visited, depth - 1)
+            # AJAX endpoints are also entry points (they are the target of AJAX calls)
+            self._analyze_php_file_recursive(endpoint, graph, visited, depth - 1,
+                                            parsed_functions, is_entry_point=True)
 
         # Find JavaScript files
         js_files = self._find_linked_js(content, file_path)
@@ -128,10 +167,6 @@ class RelationshipMapper:
             ))
             # Analyze JS file for more AJAX calls
             self._analyze_js_file(js_file, graph, visited, depth - 1)
-
-        # Find database tables
-        tables = self._find_database_tables(content)
-        graph.database_tables.update(tables)
 
         # Find form submissions
         form_targets = self._find_form_submissions(content)
@@ -178,6 +213,10 @@ class RelationshipMapper:
     def analyze_laravel_route(self, route_path: str, depth: int = 3) -> RelationshipGraph:
         """Analyze a Laravel route and its complete stack.
 
+        Handles both web routes (JS) and API routes (PHP):
+        - Web routes: .routes.js → Vue component → API calls → controllers
+        - API routes: routes/API/*.php → controller directly
+
         Args:
             route_path: Route path (e.g., 'warehouse/cycle-count')
             depth: How deep to follow relationships
@@ -188,17 +227,47 @@ class RelationshipMapper:
         graph = RelationshipGraph()
         visited = set()
 
-        # Find route definition
+        # Find route definition (checks both JS and PHP routes)
         route_info = self._find_route_definition(route_path)
 
         if not route_info:
             return graph
 
-        # Start analysis from controller
-        controller_file = route_info["controller_file"]
-        method = route_info["method"]
+        route_category = route_info.get('route_category', 'api')
 
-        self._analyze_laravel_controller(controller_file, method, graph, visited, depth)
+        if route_category == 'web':
+            # Web route: analyze Vue component first
+            component_file = route_info.get('component_file')
+            if component_file:
+                # Add route file as entry point
+                route_file = route_info.get('route_file', '')
+                if route_file:
+                    graph.nodes[route_file] = {
+                        "type": "js_route",
+                        "language": "javascript",
+                        "route": route_info.get('path')
+                    }
+                    graph.entry_points.append(route_file)
+
+                # Analyze Vue component and its API calls
+                self._analyze_web_route(component_file, graph, visited, depth)
+        else:
+            # API route: analyze controller directly
+            controller_file = route_info.get("controller_file")
+            method = route_info.get("method")
+
+            if controller_file and method:
+                # Add route file as entry point
+                route_file = route_info.get('route_file', '')
+                if route_file:
+                    graph.nodes[route_file] = {
+                        "type": "php_route",
+                        "language": "php",
+                        "route": route_info.get('route')
+                    }
+                    graph.entry_points.append(route_file)
+
+                self._analyze_laravel_controller(controller_file, method, graph, visited, depth)
 
         return graph
 
@@ -273,6 +342,92 @@ class RelationshipMapper:
             # Find database tables
             tables = self._find_database_tables(method_content)
             graph.database_tables.update(tables)
+
+    def _analyze_web_route(self, component_file: str, graph: RelationshipGraph,
+                           visited: Set[str], depth: int):
+        """Analyze web route starting from Vue component.
+
+        Process:
+        1. Parse Vue component
+        2. Find child components and analyze them
+        3. Find API calls and analyze their controllers
+        """
+        if depth <= 0 or component_file in visited:
+            return
+
+        visited.add(component_file)
+
+        # Add Vue component node
+        graph.nodes[component_file] = {
+            "type": "vue_component",
+            "language": "javascript"
+        }
+
+        if component_file not in graph.entry_points:
+            graph.entry_points.append(component_file)
+
+        # Parse Vue component using VueParser
+        try:
+            vue_data = self.vue_parser.parse_vue_file(component_file)
+        except Exception as e:
+            graph.nodes[component_file]["error"] = str(e)
+            return
+
+        if not vue_data.get('parsed'):
+            return
+
+        dependencies = vue_data.get('dependencies', {})
+
+        # 1. Analyze child components
+        child_components = dependencies.get('child_components', [])
+        for child in child_components:
+            child_file = child.get('resolved_path')
+            if child_file:
+                graph.edges.append(FileRelationship(
+                    source_file=component_file,
+                    target_file=child_file,
+                    relationship_type="imports_component",
+                    context=child.get('name', '')
+                ))
+                # Recursively analyze child component
+                self._analyze_web_route(child_file, graph, visited, depth - 1)
+
+        # 2. Analyze API calls
+        api_calls = dependencies.get('api_calls', [])
+        for api_call in api_calls:
+            endpoint = api_call.get('url', '')
+            method = api_call.get('method', 'GET')
+
+            if not endpoint:
+                continue
+
+            # Clean endpoint (remove /api prefix if present)
+            clean_endpoint = endpoint.strip('/').replace('api/', '')
+
+            graph.edges.append(FileRelationship(
+                source_file=component_file,
+                target_file=endpoint,
+                relationship_type=f"api_{method.lower()}",
+                context=method
+            ))
+
+            # Find the controller for this API endpoint
+            route_info = self._find_route_definition(clean_endpoint)
+            if route_info and route_info.get('route_category') == 'api':
+                controller_file = route_info.get("controller_file")
+                controller_method = route_info.get("method")
+
+                if controller_file and controller_method:
+                    graph.edges.append(FileRelationship(
+                        source_file=endpoint,
+                        target_file=controller_file,
+                        relationship_type="route_to_controller",
+                        context=controller_method
+                    ))
+
+                    # Analyze the API controller
+                    self._analyze_laravel_controller(controller_file, controller_method,
+                                                     graph, visited, depth - 1)
 
     def _analyze_vue_component(self, component_file: str, graph: RelationshipGraph,
                                visited: Set[str], depth: int):
@@ -401,6 +556,75 @@ class RelationshipMapper:
 
         return forms
 
+    def _find_php_function_calls(self, content: str) -> Set[str]:
+        """Find function calls in PHP code."""
+        function_calls = set()
+
+        # Pattern to match function calls: functionName(
+        pattern = r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\('
+
+        matches = re.finditer(pattern, content)
+        for match in matches:
+            func_name = match.group(1)
+            # Filter out common PHP keywords and built-in functions
+            if func_name.lower() not in [
+                'if', 'while', 'for', 'foreach', 'switch', 'array', 'isset', 'empty',
+                'count', 'strlen', 'strpos', 'explode', 'implode', 'trim', 'date',
+                'time', 'unset', 'die', 'exit', 'echo', 'print', 'var_dump', 'print_r'
+            ]:
+                function_calls.add(func_name)
+
+        return function_calls
+
+    def _parse_php_function(self, function_name: str, file_path: str) -> Set[str]:
+        """Parse a specific function from a PHP file and extract its tables.
+
+        Args:
+            function_name: Name of the function to parse
+            file_path: Path to the PHP file containing the function
+
+        Returns:
+            Set of table names found in the function body
+        """
+        try:
+            full_path = self._resolve_path(file_path)
+            with open(full_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception:
+            return set()
+
+        # Pattern to match function definition
+        # Matches: function functionName(...) {
+        func_pattern = rf'function\s+{re.escape(function_name)}\s*\([^)]*\)\s*{{'
+
+        func_match = re.search(func_pattern, content, re.IGNORECASE)
+        if not func_match:
+            return set()
+
+        # Find the function body using brace tracking
+        # The match includes the opening brace, so start after it
+        opening_brace_pos = func_match.group().rfind('{')
+        start_pos = func_match.start() + opening_brace_pos + 1
+
+        # Track braces to find the function's closing brace
+        brace_depth = 1
+        end_pos = start_pos
+
+        for i in range(start_pos, len(content)):
+            if content[i] == '{':
+                brace_depth += 1
+            elif content[i] == '}':
+                brace_depth -= 1
+                if brace_depth == 0:
+                    end_pos = i
+                    break
+
+        # Extract function body
+        function_body = content[start_pos:end_pos]
+
+        # Extract tables from this function body only
+        return self._find_database_tables(function_body)
+
     def _find_database_tables(self, content: str) -> Set[str]:
         """Find database table references."""
         tables = set()
@@ -413,69 +637,73 @@ class RelationshipMapper:
             r'UPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)',
             # Laravel DB facade
             r'DB::table\s*\([\'"]([^\'"\s]+)[\'"]',
-            # Eloquent (try to infer table from model name)
-            r'([A-Z][a-zA-Z]*)::'
+            # add_row function call - first parameter is table name
+            r'add_row\s*\(\s*[\'"]([^\'"\s]+)[\'"]',
         ]
 
         for pattern in patterns:
             matches = re.finditer(pattern, content, re.IGNORECASE)
             for match in matches:
                 table = match.group(1)
-                # Filter out common keywords
-                if table.lower() not in ['select', 'where', 'and', 'or', 'on']:
+                # Filter out common keywords and invalid table names
+                if table.lower() not in [
+                    'select', 'where', 'and', 'or', 'on', 'as', 'using',
+                    'an', 'a', 'the', 'this', 'that', 'in', 'is'
+                ] and len(table) > 2:  # Table names are typically longer than 2 chars
                     tables.add(table)
 
         return tables
 
     def _find_route_definition(self, route_path: str) -> Optional[Dict]:
-        """Find route definition in Laravel route files."""
-        route_files = [
-            self.laravel_root / "routes" / "web.php",
-            self.laravel_root / "routes" / "api.php"
+        """Find route definition in both JS routes (web) and PHP routes (API).
+
+        Handles:
+        - Web routes: defined in .routes.js files
+        - API routes: defined in routes/API/*.php
+        - Exact matches: warehouse/cycle-count
+        - API prefix: api/warehouse/cycle-count
+        - Leading slash variations
+        - Route parameters: warehouse/cycle-count/{id}
+        """
+        # 1. Try JavaScript routes first (web routes)
+        js_route = self.js_route_parser.find_route(route_path)
+        if js_route:
+            js_route['route_category'] = 'web'
+            return js_route
+
+        # 2. Try PHP API routes
+        # Try different route path variations for API routes
+        route_variations = [
+            route_path,                          # warehouse/cycle-count
+            f"api/{route_path}",                 # api/warehouse/cycle-count
+            route_path.lstrip('/'),              # Remove leading slash
+            f"api/{route_path.lstrip('/')}",     # api/... without leading slash
+            f"warehouse/{route_path}",           # warehouse/... prefix
         ]
 
-        for route_file in route_files:
-            if not route_file.exists():
-                continue
+        # Try each variation in PHP routes
+        for variation in route_variations:
+            route_info = self.route_parser.find_route(variation)
+            if route_info:
+                route_info['route_category'] = 'api'
+                return route_info
 
-            with open(route_file, 'r', encoding='utf-8') as f:
-                content = f.read()
+        # If exact match fails, try searching all PHP routes for partial match
+        all_routes = self.route_parser.list_all_routes()
 
-            # Look for route definition
-            patterns = [
-                rf'Route::(?:get|post|put|patch|delete)\s*\([\'"]/?{re.escape(route_path)}[\'"],\s*\[([^\]]+)\]',
-                rf'Route::(?:get|post|put|patch|delete)\s*\([\'"]/?{re.escape(route_path)}[\'"],\s*[\'"]([^\'"\s]+)@([^\'"\s]+)[\'"]'
-            ]
+        # Normalize the search path
+        search_path = route_path.strip('/').replace('api/', '').replace('warehouse/', '')
 
-            for pattern in patterns:
-                match = re.search(pattern, content)
-                if match:
-                    if '@' in match.group(0):
-                        # Old-style: 'Controller@method'
-                        controller_class = match.group(1)
-                        method = match.group(2)
-                    else:
-                        # New-style: [Controller::class, 'method']
-                        array_content = match.group(1)
-                        controller_match = re.search(r'([A-Z]\w+)::class', array_content)
-                        method_match = re.search(r'[\'"](\w+)[\'"]', array_content)
+        for route in all_routes:
+            route_normalized = route['route'].strip('/').replace('api/', '').replace('warehouse/', '')
 
-                        if controller_match and method_match:
-                            controller_class = controller_match.group(1)
-                            method = method_match.group(1)
-                        else:
-                            continue
+            # Check for exact match or match without parameters
+            route_without_params = re.sub(r'\{[^}]+\}', '', route_normalized).strip('/')
+            search_without_params = re.sub(r'\{[^}]+\}', '', search_path).strip('/')
 
-                    # Convert controller class to file path
-                    controller_file = f"app/Http/Controllers/{controller_class}.php"
-
-                    return {
-                        "route": route_path,
-                        "controller": controller_class,
-                        "controller_file": controller_file,
-                        "method": method,
-                        "route_file": str(route_file)
-                    }
+            if route_normalized == search_path or route_without_params == search_without_params:
+                route['route_category'] = 'api'
+                return route
 
         return None
 
@@ -505,7 +733,7 @@ class RelationshipMapper:
 
         patterns = [
             r'use\s+App\\Services\\([A-Z][a-zA-Z]+)',
-            r'new\s+([A-Z][a-zA-Z]+Service)\s*\(',
+            r'new\s+([A-Z][a-zA-Z]+Service)\s*[\(\)]',  # Matches both new Service() and (new Service)
             r'\$this->([a-z][a-zA-Z]+Service)'
         ]
 

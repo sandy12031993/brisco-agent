@@ -1125,7 +1125,55 @@ def analyze(target: str, smart: bool, analysis_type: str, depth: int, focus: str
             if related:
                 output_lines.append("- **Related files:**")
                 for rel in related:
-                    output_lines.append(f"  - {rel['relationship_type']}: `{Path(rel['target_file']).name}`")
+                    rel_type = rel['relationship_type']
+
+                    # For API calls, show the complete chain: API → Controller → Models/Services
+                    if rel_type.startswith('api_'):
+                        api_endpoint = rel['target_file']
+                        output_lines.append(f"  - {rel_type}: `{api_endpoint}`")
+
+                        # Find controller that handles this API endpoint (deduplicated)
+                        controller_edges = [e for e in graph_dict['edges']
+                                          if e['source_file'] == api_endpoint
+                                          and e['relationship_type'] == 'route_to_controller']
+
+                        # Deduplicate controllers by file+method
+                        seen_controllers = set()
+                        for ctrl_edge in controller_edges:
+                            controller_file = ctrl_edge['target_file']
+                            controller_method = ctrl_edge.get('context', 'unknown')
+                            controller_key = f"{controller_file}#{controller_method}"
+
+                            # Skip if we've already shown this controller for this API endpoint
+                            if controller_key in seen_controllers:
+                                continue
+                            seen_controllers.add(controller_key)
+
+                            controller_name = Path(controller_file).stem
+                            output_lines.append(f"    → Controller: `{controller_name}@{controller_method}`")
+
+                            # Find models used by this controller
+                            model_edges = [e for e in graph_dict['edges']
+                                         if e['source_file'] == controller_file
+                                         and e['relationship_type'] == 'uses_model']
+
+                            if model_edges:
+                                model_names = [e.get('context', Path(e['target_file']).stem)
+                                             for e in model_edges]
+                                output_lines.append(f"      → Models: {', '.join(f'`{m}`' for m in model_names)}")
+
+                            # Find services used by this controller
+                            service_edges = [e for e in graph_dict['edges']
+                                           if e['source_file'] == controller_file
+                                           and e['relationship_type'] == 'uses_service']
+
+                            if service_edges:
+                                service_names = [e.get('context', Path(e['target_file']).stem)
+                                               for e in service_edges]
+                                output_lines.append(f"      → Services: {', '.join(f'`{s}`' for s in service_names)}")
+                    else:
+                        # Regular relationship
+                        output_lines.append(f"  - {rel_type}: `{Path(rel['target_file']).name}`")
 
             output_lines.append("")
 
@@ -1507,6 +1555,99 @@ def progress(feature_name: str):
     console.print("  1. Complete Vue component migration")
     console.print("  2. Implement remaining features")
     console.print("  3. Add comprehensive testing")
+
+@cli.command()
+@click.option('--type', 'route_type', type=click.Choice(['all', 'api', 'web']), default='all',
+              help='Type of routes to list')
+@click.option('--search', '-s', help='Search for routes containing this text')
+@click.option('--output', '-o', type=click.Path(), help='Save routes to file')
+def list_routes(route_type: str, search: Optional[str], output: Optional[str]):
+    """List all Laravel routes.
+
+    Examples:
+        # List all routes
+        python main.py list-routes
+
+        # List only API routes
+        python main.py list-routes --type api
+
+        # Search for specific routes
+        python main.py list-routes --search warehouse
+
+        # Save to file
+        python main.py list-routes --output routes.txt
+    """
+    from analyzers.route_parser import RouteParser
+
+    try:
+        config = load_config()
+        laravel_root = Path(config['project']['laravel_path'])
+
+        if not laravel_root.exists():
+            console.print("[red]Laravel directory not found![/red]")
+            console.print(f"Check: {laravel_root}")
+            return
+
+        # Initialize route parser
+        parser = RouteParser(str(laravel_root))
+
+        # Get all routes
+        routes = parser.list_all_routes(route_type)
+
+        # Filter by search if provided
+        if search:
+            routes = [r for r in routes if search.lower() in r['route'].lower() or
+                      search.lower() in r.get('controller', '').lower()]
+
+        if not routes:
+            console.print("[yellow]No routes found matching criteria[/yellow]")
+            return
+
+        # Display routes
+        console.print(f"\n[bold]Laravel Routes ({len(routes)})[/bold]")
+        if search:
+            console.print(f"Matching: {search}")
+        console.print("")
+
+        # Create table
+        table = Table()
+        table.add_column("Method", style="cyan", width=8)
+        table.add_column("Route", style="green", width=40)
+        table.add_column("Controller", style="yellow", width=30)
+        table.add_column("Action", style="magenta", width=20)
+        table.add_column("Type", style="blue", width=6)
+
+        for route in routes:
+            table.add_row(
+                route['http_method'].upper(),
+                route['route'],
+                route['controller'],
+                route['method'],
+                route['route_type']
+            )
+
+        console.print(table)
+
+        # Save to file if requested
+        if output:
+            output_lines = []
+            output_lines.append(f"Laravel Routes - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            output_lines.append(f"Total: {len(routes)} routes")
+            output_lines.append("")
+
+            for route in routes:
+                output_lines.append(
+                    f"{route['http_method'].upper():8} /{route['route']:40} → "
+                    f"{route['controller']}@{route['method']} ({route['route_type']})"
+                )
+
+            Path(output).write_text('\n'.join(output_lines), encoding='utf-8')
+            console.print(f"\n[green]✓ Routes saved to {output}[/green]")
+
+    except Exception as e:
+        console.print(f"[red]Error listing routes: {e}[/red]")
+        import traceback
+        console.print(traceback.format_exc())
 
 if __name__ == "__main__":
     cli()

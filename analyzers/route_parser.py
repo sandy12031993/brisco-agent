@@ -20,12 +20,17 @@ class RouteParser:
             laravel_root: Root directory of Laravel project
         """
         self.laravel_root = Path(laravel_root)
+
+        # Standard Laravel route files
         self.route_files = {
             "web": self.laravel_root / "routes" / "web.php",
             "api": self.laravel_root / "routes" / "api.php",
             "channels": self.laravel_root / "routes" / "channels.php",
             "console": self.laravel_root / "routes" / "console.php"
         }
+
+        # Custom API routes directory (routes/API/*.php)
+        self.api_routes_dir = self.laravel_root / "routes" / "API"
 
     def find_route(self, route_path: str) -> Optional[Dict]:
         """Find route definition by path.
@@ -36,6 +41,7 @@ class RouteParser:
         Returns:
             Route information dict or None
         """
+        # Search standard route files
         for route_type, file_path in self.route_files.items():
             if not file_path.exists():
                 continue
@@ -43,6 +49,13 @@ class RouteParser:
             route_info = self._search_route_file(file_path, route_path, route_type)
             if route_info:
                 return route_info
+
+        # Search custom API routes directory (routes/API/*.php)
+        if self.api_routes_dir.exists():
+            for api_file in self.api_routes_dir.glob("*.php"):
+                route_info = self._search_route_file(api_file, route_path, "api")
+                if route_info:
+                    return route_info
 
         return None
 
@@ -57,8 +70,9 @@ class RouteParser:
         """
         all_routes = []
 
+        # Search standard route files
         files_to_search = self.route_files.items()
-        if route_type != "all":
+        if route_type != "all" and route_type in self.route_files:
             files_to_search = [(route_type, self.route_files[route_type])]
 
         for rtype, file_path in files_to_search:
@@ -67,6 +81,12 @@ class RouteParser:
 
             routes = self._parse_all_routes(file_path, rtype)
             all_routes.extend(routes)
+
+        # Search custom API routes directory (routes/API/*.php)
+        if route_type in ["all", "api"] and self.api_routes_dir.exists():
+            for api_file in self.api_routes_dir.glob("*.php"):
+                routes = self._parse_all_routes(api_file, "api")
+                all_routes.extend(routes)
 
         return all_routes
 
@@ -126,11 +146,17 @@ class RouteParser:
         return None
 
     def _parse_all_routes(self, file_path: Path, route_type: str) -> List[Dict]:
-        """Parse all routes from a route file."""
+        """Parse all routes from a route file with prefix tracking."""
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
 
         routes = []
+
+        # Extract controller use statements for namespace resolution
+        controller_map = self._extract_controller_namespaces(content)
+
+        # Extract route prefixes and their nesting
+        prefix_stack = self._extract_route_prefixes(content)
 
         # Find all route definitions
         patterns = [
@@ -145,9 +171,19 @@ class RouteParser:
                 route_path = match.group(2).strip('/')
                 controller_str = match.group(3)
 
+                # Find which prefix group this route belongs to
+                route_position = match.start()
+                full_prefix = self._get_prefix_at_position(content, route_position, prefix_stack)
+
+                # Combine prefix with route path
+                if full_prefix:
+                    route_path = f"{full_prefix}/{route_path}".strip('/')
+
                 # Parse controller info
                 if http_method in ['resource', 'apiResource']:
                     controller_info = self._parse_resource_controller(controller_str)
+                    # Resolve full controller class with namespace
+                    controller_class = controller_map.get(controller_info['controller'], controller_info['controller'])
                     # Resources have multiple methods
                     for method in self._get_resource_methods(http_method):
                         routes.append({
@@ -156,7 +192,7 @@ class RouteParser:
                             'route_type': route_type,
                             'controller': controller_info['controller'],
                             'method': method['method'],
-                            'controller_file': self._controller_to_file(controller_info['controller']),
+                            'controller_file': self._controller_to_file(controller_class),
                             'route_file': str(file_path),
                             'is_resource': True
                         })
@@ -167,13 +203,16 @@ class RouteParser:
                         controller_info = self._parse_array_controller(controller_str)
 
                     if controller_info:
+                        # Resolve full controller class with namespace
+                        controller_class = controller_map.get(controller_info['controller'], controller_info['controller'])
+
                         routes.append({
                             'route': route_path,
                             'http_method': http_method,
                             'route_type': route_type,
                             'controller': controller_info['controller'],
                             'method': controller_info['method'],
-                            'controller_file': self._controller_to_file(controller_info['controller']),
+                            'controller_file': self._controller_to_file(controller_class),
                             'route_file': str(file_path),
                             'is_resource': False
                         })
@@ -298,3 +337,94 @@ class RouteParser:
         """
         all_routes = self.list_all_routes()
         return [r for r in all_routes if r['controller'] == controller_name]
+
+    def _extract_controller_namespaces(self, content: str) -> Dict[str, str]:
+        """Extract controller use statements and map class names to full namespaces.
+
+        Returns dict: {ClassName: Full\\Namespaced\\ClassName}
+        Example: {CycleCountController: App\\Http\\Controllers\\Api\\Warehouse\\CycleCountController}
+        """
+        controller_map = {}
+
+        # Find all use statements for controllers
+        use_pattern = r'use\s+(App\\Http\\Controllers\\[^;]+);'
+
+        for match in re.finditer(use_pattern, content):
+            full_namespace = match.group(1)
+            # Extract just the class name
+            class_name = full_namespace.split('\\')[-1]
+            controller_map[class_name] = full_namespace
+
+        return controller_map
+
+    def _extract_route_prefixes(self, content: str) -> List[Dict]:
+        """Extract all Route::prefix() groups and their positions.
+
+        Returns list of dicts with: prefix, start_pos, end_pos, depth
+        """
+        prefixes = []
+
+        # Find all Route::prefix() calls
+        prefix_pattern = r'Route::prefix\s*\(\s*[\'"]([^\'\"]+)[\'"]\s*\)\s*->\s*group\s*\('
+
+        for match in re.finditer(prefix_pattern, content):
+            prefix = match.group(1).strip('/')
+            start = match.end()
+
+            # Find the matching closing parenthesis/brace
+            # The group starts with function () {
+            func_start = content.find('{', start)
+            if func_start == -1:
+                continue
+
+            # Track brace depth
+            depth = 1
+            i = func_start + 1
+            end = -1
+
+            while i < len(content) and depth > 0:
+                if content[i] == '{':
+                    depth += 1
+                elif content[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+                i += 1
+
+            if end != -1:
+                prefixes.append({
+                    'prefix': prefix,
+                    'start': func_start,
+                    'end': end
+                })
+
+        return prefixes
+
+    def _get_prefix_at_position(self, content: str, position: int,
+                                 prefix_data: List[Dict]) -> str:
+        """Get the full prefix path for a route at a given position.
+
+        Handles nested prefixes like:
+        Route::prefix('warehouse')->group(function() {
+            Route::prefix('cycle-count')->group(function() {
+                Route::post('/get-data', ...)  // Full path: warehouse/cycle-count/get-data
+            });
+        });
+        """
+        # Find all prefixes that contain this position
+        active_prefixes = []
+
+        for prefix_info in prefix_data:
+            if prefix_info['start'] <= position <= prefix_info['end']:
+                active_prefixes.append(prefix_info)
+
+        if not active_prefixes:
+            return ""
+
+        # Sort by start position (outermost first)
+        active_prefixes.sort(key=lambda x: x['start'])
+
+        # Build full prefix path
+        prefix_parts = [p['prefix'] for p in active_prefixes]
+        return '/'.join(prefix_parts)
