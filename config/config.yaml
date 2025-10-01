@@ -1,0 +1,71 @@
+project:
+  name: "PHP-to-Laravel Migration"
+  root_path: "C:/MAMP/htdocs/br"
+  core_path: "C:/MAMP/htdocs/br/core"
+  laravel_path: "C:/MAMP/htdocs/br/laravel"
+
+analysis_files:
+  core_analysis: "C:/MAMP/htdocs/br/core_project_analysis.json"
+  laravel_analysis: "C:/MAMP/htdocs/br/laravel_project_analysis.json"
+  database_analysis: "C:/MAMP/htdocs/br/database_schema_analysis.json"
+
+knowledge:
+  patterns_file: "knowledge/patterns.json"
+  migrations_map: "knowledge/migrations_map.json"
+  insights_db: "knowledge/learned_insights.db"
+
+ai_provider:
+  # Options: 'none', 'anthropic', 'openai', 'cursor'
+  mode: 'none'  # Default: no API, use manual Claude Code workflow
+
+  # API Keys (optional - only needed if mode != 'none')
+  # Can use environment variables: ${ANTHROPIC_API_KEY}, ${OPENAI_API_KEY}, etc.
+  anthropic_api_key: null
+  openai_api_key: null
+  cursor_api_key: null
+
+  # Token limits per provider
+  token_limits:
+    anthropic:
+      max_tokens_per_request: 4000
+      model: 'claude-3-5-sonnet-20241022'
+      context_window: 200000
+    openai:
+      max_tokens_per_request: 4000
+      model: 'gpt-4-turbo-preview'
+      context_window: 128000
+    cursor:
+      max_tokens_per_request: 4000
+      model: 'claude-3-5-sonnet-20241022'
+      context_window: 200000
+
+  # Fallback behavior
+  fallback_to_manual: true  # If API fails, export for manual review
+  manual_export_path: "claude_context"  # Directory for manual review files
+
+# Token budget management (applies to all modes)
+token_budget:
+  max_tokens_per_analysis: 3000
+  max_tokens_per_session: 30000
+  warn_at_percentage: 80
+  track_usage: true
+
+agents:
+  php_legacy:
+    name: "PHP Legacy Agent"
+    extensions: [".php", ".inc", ".class.php"]
+    ignore_patterns: ["vendor/", "cache/", "tmp/"]
+
+  laravel:
+    name: "Laravel Agent"
+    extensions: [".php", ".vue", ".js", ".blade.php"]
+    paths: ["app/", "resources/", "routes/"]
+
+  database:
+    name: "Database Agent"
+    extensions: [".sql", ".php"]
+    migration_paths: ["database/migrations/"]
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

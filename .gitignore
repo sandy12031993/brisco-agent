@@ -1,0 +1,94 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# Knowledge Database & Patterns (auto-generated)
+knowledge/learned_insights.db
+knowledge/learned_insights.db-journal
+knowledge/patterns.json
+knowledge/token_usage.db
+knowledge/token_usage.db-journal
+outputs/
+
+# Analysis Cache Files
+*.cache
+temp_analysis/
+
+# Logs
+*.log
+logs/
+
+# System Files
+.DS_Store
+Thumbs.db
+
+# Temporary Files
+*.tmp
+*.temp
+temp/
+
+# Backup Files
+*.bak
+*.backup
+
+# Output Files (unless specifically tracked)
+*.output
+results/
+reports/
+
+# Test & Generated Analysis Files
+test_*.md
+test_analysis.md
+claude_context.md
+analysis_*.md
+
+# API Keys and Secrets
+secrets.yaml
+api_keys.txt
+
+# Large Analysis Files (optional - you may want to track these)
+# *.json
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
