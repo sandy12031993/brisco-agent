@@ -759,6 +759,26 @@ Run with verbose output:
 python main.py analyze-file path/to/file.php --verbose
 ```
 
+## Project Structure
+
+The codebase is organized for clarity and maintainability:
+
+```
+.agent/
+├── docs/              # 📚 All documentation
+│   ├── setup/         # Installation guides
+│   ├── guides/        # User tutorials
+│   └── fixes/         # Bug fix summaries
+├── scripts/           # 🔧 Executable scripts
+│   └── tests/         # Test scripts
+├── analyzers/         # Code analysis modules
+├── agents/            # AI agent modules
+├── utils/             # Utility functions
+└── examples/          # Example files
+```
+
+📖 **See [DIRECTORY_STRUCTURE.md](DIRECTORY_STRUCTURE.md) for complete details**
+
 ## Contributing
 
 This system is designed to be extensible and can be customized for your specific migration needs. Key extension points include:
