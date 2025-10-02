@@ -1649,5 +1649,290 @@ def list_routes(route_type: str, search: Optional[str], output: Optional[str]):
         import traceback
         console.print(traceback.format_exc())
 
+
+@cli.command()
+@click.option('--host', default='localhost', help='Database host (default: localhost)')
+@click.option('--port', default=3306, type=int, help='Database port (default: 3306)')
+@click.option('--user', default='root', help='Database user (default: root)')
+@click.option('--password', prompt=True, hide_input=True, help='Database password')
+@click.option('--database', required=True, help='Database name to analyze')
+@click.option('--table', '-t', help='Analyze specific table (default: all tables)')
+@click.option('--search', '-s', help='Search tables by pattern')
+@click.option('--output', '-o', type=click.Path(), help='Save analysis to file')
+@click.option('--format', 'output_format', type=click.Choice(['json', 'markdown', 'summary']),
+              default='summary', help='Output format')
+def analyze_database(host: str, port: int, user: str, password: str, database: str,
+                     table: Optional[str], search: Optional[str], output: Optional[str],
+                     output_format: str):
+    """Analyze MySQL database schema directly.
+
+    Connect to a MySQL database and extract detailed schema information including:
+    - Table structures (columns, types, constraints)
+    - Primary keys and indexes
+    - Foreign key relationships
+    - Database statistics
+
+    Examples:
+        # Analyze entire database
+        python main.py analyze-database --database br_laravel --password yourpass
+
+        # Analyze specific table
+        python main.py analyze-database --database br_laravel --password yourpass --table users
+
+        # Search for tables
+        python main.py analyze-database --database br_laravel --password yourpass --search "user"
+
+        # Save to file with JSON format
+        python main.py analyze-database --database br_laravel --password yourpass --format json --output db_schema.json
+
+        # Custom host/port
+        python main.py analyze-database --host 192.168.1.100 --port 3306 --database br_laravel --password yourpass
+    """
+    from utils.database_connector import DatabaseConnector
+
+    try:
+        # Create database connector
+        connector = DatabaseConnector(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database
+        )
+
+        # Connect to database
+        console.print(f"[yellow]Connecting to database {database} at {host}:{port}...[/yellow]")
+        if not connector.connect():
+            console.print("[red]✗ Failed to connect to database[/red]")
+            console.print("Check your connection details and try again.")
+            return
+
+        console.print("[green]✓ Connected successfully[/green]\n")
+
+        # Handle different analysis modes
+        analysis_results = {}
+
+        if table:
+            # Analyze specific table
+            console.print(f"[yellow]Analyzing table: {table}[/yellow]")
+            schema = connector.get_table_schema(table)
+
+            if 'error' in schema:
+                console.print(f"[red]Error analyzing table {table}: {schema['error']}[/red]")
+                return
+
+            analysis_results = {'table': schema}
+
+            # Display summary
+            if output_format == 'summary':
+                console.print(f"\n[bold]Table: {table}[/bold]")
+                console.print(f"Columns: {schema['column_count']}")
+                console.print(f"Indexes: {len(schema['indexes'])}")
+                console.print(f"Foreign Keys: {len(schema['foreign_keys'])}")
+
+                if schema['columns']:
+                    console.print("\n[bold]Columns:[/bold]")
+                    table_display = Table(show_header=True, header_style="bold cyan")
+                    table_display.add_column("Name")
+                    table_display.add_column("Type")
+                    table_display.add_column("Nullable")
+                    table_display.add_column("Default")
+
+                    for col in schema['columns']:
+                        table_display.add_row(
+                            col['name'],
+                            col['type'],
+                            "Yes" if col['nullable'] else "No",
+                            str(col['default']) if col['default'] else ""
+                        )
+
+                    console.print(table_display)
+
+        elif search:
+            # Search for tables
+            console.print(f"[yellow]Searching for tables matching: {search}[/yellow]")
+            matching_tables = connector.search_tables(search)
+
+            if not matching_tables:
+                console.print(f"[yellow]No tables found matching '{search}'[/yellow]")
+                return
+
+            console.print(f"\n[green]Found {len(matching_tables)} matching table(s):[/green]")
+            for tbl in matching_tables:
+                console.print(f"  • {tbl}")
+
+            # Get schemas for matching tables
+            analysis_results = {
+                'search_pattern': search,
+                'matching_tables': matching_tables,
+                'schemas': {}
+            }
+
+            for tbl in matching_tables:
+                analysis_results['schemas'][tbl] = connector.get_table_schema(tbl)
+
+        else:
+            # Analyze entire database
+            console.print("[yellow]Analyzing entire database...[/yellow]")
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console
+            ) as progress:
+                task = progress.add_task("Extracting schema information...", total=None)
+
+                # Get database summary
+                summary = connector.get_database_summary()
+                progress.update(task, description="Getting all table schemas...")
+
+                # Get all schemas
+                all_schemas = connector.get_all_schemas()
+                progress.update(task, description="Analyzing relationships...")
+
+                # Get relationships
+                relationships = connector.get_table_relationships()
+
+            analysis_results = {
+                'summary': summary,
+                'schemas': all_schemas,
+                'relationships': relationships
+            }
+
+            # Display summary
+            if output_format == 'summary':
+                console.print(f"\n[bold]Database Summary: {database}[/bold]")
+                console.print(f"Total Tables: {summary['total_tables']}")
+                console.print(f"Total Columns: {summary['total_columns']}")
+                console.print(f"Total Indexes: {summary['total_indexes']}")
+                console.print(f"Total Foreign Keys: {summary['total_foreign_keys']}")
+                console.print(f"Tables with Primary Key: {summary['tables_with_primary_key']}")
+                console.print(f"Tables without Primary Key: {summary['tables_without_primary_key']}")
+
+                if summary['tables_without_primary_key'] > 0:
+                    console.print("\n[yellow]⚠ Warning: Some tables don't have primary keys[/yellow]")
+
+                console.print(f"\n[bold]All Tables ({summary['total_tables']}):[/bold]")
+                for tbl in sorted(summary['table_list']):
+                    console.print(f"  • {tbl}")
+
+        # Save to file if requested
+        if output:
+            if output_format == 'json':
+                output_content = json.dumps(analysis_results, indent=2, default=str)
+            elif output_format == 'markdown':
+                output_content = _format_database_analysis_markdown(analysis_results, database, table, search)
+            else:  # summary
+                output_content = _format_database_analysis_text(analysis_results, database, table, search)
+
+            Path(output).write_text(output_content, encoding='utf-8')
+            console.print(f"\n[green]✓ Analysis saved to {output}[/green]")
+
+        # Close connection
+        connector.close()
+
+    except Exception as e:
+        console.print(f"[red]Error analyzing database: {e}[/red]")
+        import traceback
+        console.print(traceback.format_exc())
+
+
+def _format_database_analysis_markdown(analysis: Dict, database: str,
+                                       table: Optional[str], search: Optional[str]) -> str:
+    """Format database analysis as markdown."""
+    lines = []
+    lines.append(f"# Database Analysis: {database}")
+    lines.append(f"\n*Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n")
+
+    if table:
+        # Single table analysis
+        schema = analysis['table']
+        lines.append(f"## Table: {table}\n")
+        lines.append(f"- **Columns:** {schema['column_count']}")
+        lines.append(f"- **Indexes:** {len(schema['indexes'])}")
+        lines.append(f"- **Foreign Keys:** {len(schema['foreign_keys'])}\n")
+
+        lines.append("### Columns\n")
+        lines.append("| Name | Type | Nullable | Default | Auto Increment |")
+        lines.append("|------|------|----------|---------|----------------|")
+        for col in schema['columns']:
+            lines.append(
+                f"| {col['name']} | {col['type']} | "
+                f"{'Yes' if col['nullable'] else 'No'} | "
+                f"{col['default'] or ''} | "
+                f"{'Yes' if col.get('autoincrement') else 'No'} |"
+            )
+
+    elif search:
+        # Search results
+        lines.append(f"## Search Results: '{search}'\n")
+        lines.append(f"Found {len(analysis['matching_tables'])} matching table(s):\n")
+        for tbl in analysis['matching_tables']:
+            lines.append(f"- {tbl}")
+
+    else:
+        # Full database analysis
+        summary = analysis['summary']
+        lines.append("## Summary\n")
+        lines.append(f"- **Total Tables:** {summary['total_tables']}")
+        lines.append(f"- **Total Columns:** {summary['total_columns']}")
+        lines.append(f"- **Total Indexes:** {summary['total_indexes']}")
+        lines.append(f"- **Total Foreign Keys:** {summary['total_foreign_keys']}")
+        lines.append(f"- **Tables with Primary Key:** {summary['tables_with_primary_key']}")
+        lines.append(f"- **Tables without Primary Key:** {summary['tables_without_primary_key']}\n")
+
+        lines.append("## All Tables\n")
+        for tbl in sorted(summary['table_list']):
+            lines.append(f"- {tbl}")
+
+    return '\n'.join(lines)
+
+
+def _format_database_analysis_text(analysis: Dict, database: str,
+                                   table: Optional[str], search: Optional[str]) -> str:
+    """Format database analysis as plain text."""
+    lines = []
+    lines.append(f"Database Analysis: {database}")
+    lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("=" * 70)
+    lines.append("")
+
+    if table:
+        schema = analysis['table']
+        lines.append(f"Table: {table}")
+        lines.append(f"Columns: {schema['column_count']}")
+        lines.append(f"Indexes: {len(schema['indexes'])}")
+        lines.append(f"Foreign Keys: {len(schema['foreign_keys'])}")
+        lines.append("")
+
+        lines.append("Columns:")
+        for col in schema['columns']:
+            lines.append(
+                f"  • {col['name']} ({col['type']}) "
+                f"{'NULL' if col['nullable'] else 'NOT NULL'}"
+            )
+
+    elif search:
+        lines.append(f"Search Results: '{search}'")
+        lines.append(f"Found {len(analysis['matching_tables'])} matching table(s):")
+        for tbl in analysis['matching_tables']:
+            lines.append(f"  • {tbl}")
+
+    else:
+        summary = analysis['summary']
+        lines.append("Summary:")
+        lines.append(f"  Total Tables: {summary['total_tables']}")
+        lines.append(f"  Total Columns: {summary['total_columns']}")
+        lines.append(f"  Total Indexes: {summary['total_indexes']}")
+        lines.append(f"  Total Foreign Keys: {summary['total_foreign_keys']}")
+        lines.append("")
+
+        lines.append("All Tables:")
+        for tbl in sorted(summary['table_list']):
+            lines.append(f"  • {tbl}")
+
+    return '\n'.join(lines)
+
+
 if __name__ == "__main__":
     cli()

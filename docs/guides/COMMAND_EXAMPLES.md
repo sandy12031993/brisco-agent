@@ -68,6 +68,52 @@ The PowerShell argument passing has been fixed. All commands now work correctly.
 .\run.ps1 analyze warehouse/cycle-count --type route --smart --diagram --format both
 ```
 
+### 6. Database & Migration Analysis
+
+**A) Laravel Migration Analysis:**
+```powershell
+# Analyze Laravel migration file
+.\run.ps1 analyze-file ../laravel/database/migrations/2014_10_12_000000_create_users_table.php --agent database
+
+# With JSON output for detailed analysis
+.\run.ps1 analyze-file ../laravel/database/migrations/2014_10_12_000000_create_users_table.php --agent database --format json --output migration_analysis.json
+
+# Analyze SQL schema file
+.\run.ps1 analyze-file path/to/schema.sql --agent database --format markdown --output schema_analysis.md
+```
+
+**B) Direct Database Analysis (NEW! - via Docker):**
+
+**IMPORTANT:** MySQL runs in Docker, so database commands must run from inside the `brisco-agent` container.
+
+```powershell
+# Analyze entire database (all 250+ tables)
+docker exec brisco-agent python /workspace/.agent/main.py analyze-database --host mysql --database brisco --user brisco --password brisco
+
+# Analyze specific table with detailed schema
+docker exec brisco-agent python /workspace/.agent/main.py analyze-database --host mysql --database brisco --user brisco --password brisco --table product
+
+# Search for tables by pattern (e.g., all user-related tables)
+docker exec brisco-agent python /workspace/.agent/main.py analyze-database --host mysql --database brisco --user brisco --password brisco --search "user"
+
+# Export complete database schema to JSON
+docker exec brisco-agent python /workspace/.agent/main.py analyze-database --host mysql --database brisco --user brisco --password brisco --format json --output /workspace/schema.json
+
+# Generate markdown documentation of database
+docker exec brisco-agent python /workspace/.agent/main.py analyze-database --host mysql --database brisco --user brisco --password brisco --format markdown --output /workspace/database_docs.md
+```
+
+**Note:** Output files saved to `/workspace/` inside container = `C:\MAMP\htdocs\br\` on your Windows host.
+
+**C) Database Tables in Route Analysis:**
+```powershell
+# Database tables shown in route analysis
+.\run.ps1 analyze warehouse/cycle-count --type route --smart --output route_with_tables.md
+# Check "Database Tables" section in output
+```
+
+**💡 Tip:** See [DATABASE_ANALYSIS.md](DATABASE_ANALYSIS.md) for complete database analysis guide
+
 ## Other Useful Commands
 
 ### System Status
@@ -219,6 +265,9 @@ cd C:\MAMP\htdocs\br\.agent
 |------|---------|
 | Analyze route | `.\run.ps1 analyze warehouse/cycle-count --type route --smart` |
 | Analyze PHP file | `.\run.ps1 analyze ../core/index.php --smart` |
+| Analyze database | `docker exec brisco-agent python /workspace/.agent/main.py analyze-database --host mysql --database brisco --user brisco --password brisco` |
+| Analyze specific table | `docker exec brisco-agent python /workspace/.agent/main.py analyze-database --host mysql --database brisco --user brisco --password brisco --table product` |
+| Search tables | `docker exec brisco-agent python /workspace/.agent/main.py analyze-database --host mysql --database brisco --user brisco --password brisco --search "user"` |
 | With diagram | Add `--diagram` |
 | Security focus | Add `--focus security` |
 | Save output | Add `--output filename.md` |
@@ -228,5 +277,7 @@ cd C:\MAMP\htdocs\br\.agent
 
 ---
 
-**Last Updated:** After PowerShell argument fix
+**Last Updated:** After adding direct database analysis (analyze-database command via Docker)
 **All commands verified working!** ✅
+
+**Note on Database Commands:** Database analysis commands require Docker because MySQL runs in a Docker container on an internal network. The `brisco-agent` container has all dependencies pre-installed and can access the database.
