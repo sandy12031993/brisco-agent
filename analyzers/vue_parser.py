@@ -511,11 +511,114 @@ class VueParser:
 
     def _analyze_vue_dependencies(self, component: VueComponent) -> Dict[str, Any]:
         """Analyze Vue component dependencies."""
+        child_components = self._extract_child_components(component.script, component.file_path)
+
+        # Get direct API calls from component
+        api_calls = self._detect_api_calls(component.script)
+
+        # Get API calls from Vuex store actions
+        store_api_calls = self._get_store_api_calls(component.script, component.file_path)
+        api_calls.extend(store_api_calls)
+
         return {
             'vue_components': component.imports,
+            'child_components': child_components,
             'external_libraries': self._detect_external_libraries(component.script),
-            'api_calls': self._detect_api_calls(component.script)
+            'api_calls': api_calls
         }
+
+    def _extract_child_components(self, script: str, file_path: str) -> List[Dict[str, str]]:
+        """Extract child Vue component imports.
+
+        Returns:
+            List of dicts with 'name' and 'path' keys
+        """
+        child_components = []
+
+        # Match: import ComponentName from '@/path/to/Component'
+        import_patterns = [
+            r'import\s+(\w+)\s+from\s+[\'"](@/[^\'"]+)[\'"]',
+            r'import\s+(\w+)\s+from\s+[\'"](\./[^\'"]+)[\'"]',
+            r'import\s+(\w+)\s+from\s+[\'"](\.\./[^\'"]+)[\'"]',
+        ]
+
+        for pattern in import_patterns:
+            matches = re.finditer(pattern, script)
+            for match in matches:
+                comp_name = match.group(1)
+                import_path = match.group(2)
+
+                # Skip non-component imports
+                if not self._is_vue_component_import(comp_name, import_path):
+                    continue
+
+                # Resolve path
+                resolved_path = self._resolve_import_path(import_path, file_path)
+
+                child_components.append({
+                    'name': comp_name,
+                    'import_path': import_path,
+                    'resolved_path': resolved_path
+                })
+
+        return child_components
+
+    def _is_vue_component_import(self, name: str, import_path: str) -> bool:
+        """Determine if import is a Vue component."""
+        # Component names usually start with uppercase
+        if not name[0].isupper():
+            return False
+
+        # Exclude common libraries
+        exclude_libs = ['Vue', 'Router', 'Vuex', 'Axios', 'Lodash', 'Moment']
+        if name in exclude_libs:
+            return False
+
+        # Check if path looks like a component
+        component_indicators = ['/components/', '/views/', '/pages/', '.vue']
+        return any(indicator in import_path.lower() for indicator in component_indicators)
+
+    def _resolve_import_path(self, import_path: str, current_file: str) -> Optional[str]:
+        """Resolve import path to absolute file path."""
+        try:
+            current_dir = Path(current_file).parent
+
+            if import_path.startswith('@/'):
+                # @ alias usually points to src directory
+                src_path = import_path[2:]
+                # Try to find src directory
+                # Assuming structure: laravel/resources/app/src/
+                parts = Path(current_file).parts
+                if 'src' in parts:
+                    src_index = parts.index('src')
+                    src_dir = Path(*parts[:src_index + 1])
+                    resolved = src_dir / src_path
+                else:
+                    return None
+            elif import_path.startswith('./'):
+                # Relative to current file
+                resolved = current_dir / import_path[2:]
+            elif import_path.startswith('../'):
+                # Parent directory
+                resolved = current_dir / import_path
+            else:
+                return None
+
+            # Try different patterns (order matters!)
+            # 1. Directory with index.vue (most common pattern)
+            # 2. File with .vue extension
+            # 3. Directory with index.js
+            # 4. File with .js extension
+            for pattern in ['/index.vue', '.vue', '/index.js', '.js', '']:
+                full_path = Path(str(resolved) + pattern)
+                if full_path.exists():
+                    return str(full_path)
+
+            # Return expected path even if not found (prefer index.vue pattern)
+            return str(resolved) + '/index.vue'
+
+        except Exception:
+            return None
 
     def _detect_external_libraries(self, script: str) -> List[str]:
         """Detect external library imports."""
@@ -537,17 +640,230 @@ class VueParser:
 
         return libraries
 
-    def _detect_api_calls(self, script: str) -> List[str]:
-        """Detect API calls in Vue component."""
+    def _detect_api_calls(self, script: str) -> List[Dict[str, str]]:
+        """Detect API calls in Vue component.
+
+        Handles:
+        - Direct axios/fetch calls
+        - Vuex store.dispatch() calls (finds store actions and extracts API calls)
+
+        Returns:
+            List of dicts with 'url', 'method', and 'type' keys
+        """
         api_calls = []
 
-        # Look for axios calls
-        axios_calls = re.findall(r'axios\.\w+\([\'"]([^\'"]+)[\'"]', script)
-        api_calls.extend(axios_calls)
+        # Look for axios calls with different methods
+        # axios.get('/api/endpoint')
+        # axios.post('/api/endpoint', data)
+        axios_patterns = [
+            (r'axios\.(get|post|put|patch|delete|head|options)\s*\(\s*[\'"`]([^\'"` ]+)[\'"`]', 'axios'),
+            (r'axios\s*\(\s*\{\s*url\s*:\s*[\'"`]([^\'"` ]+)[\'"`].*?method\s*:\s*[\'"`](\w+)[\'"`]', 'axios_config'),
+            (r'axios\s*\(\s*\{\s*method\s*:\s*[\'"`](\w+)[\'"`].*?url\s*:\s*[\'"`]([^\'"` ]+)[\'"`]', 'axios_config_reverse'),
+        ]
+
+        for pattern, ptype in axios_patterns:
+            matches = re.finditer(pattern, script, re.DOTALL)
+            for match in matches:
+                if ptype == 'axios':
+                    method = match.group(1).upper()
+                    url = match.group(2)
+                elif ptype == 'axios_config':
+                    method = match.group(2).upper()
+                    url = match.group(1)
+                elif ptype == 'axios_config_reverse':
+                    method = match.group(1).upper()
+                    url = match.group(2)
+
+                api_calls.append({
+                    'url': url,
+                    'method': method,
+                    'type': 'axios'
+                })
 
         # Look for fetch calls
-        fetch_calls = re.findall(r'fetch\([\'"]([^\'"]+)[\'"]', script)
-        api_calls.extend(fetch_calls)
+        # fetch('/api/endpoint', { method: 'POST' })
+        fetch_patterns = [
+            (r'fetch\s*\(\s*[\'"`]([^\'"` ]+)[\'"`]\s*,\s*\{[^}]*method\s*:\s*[\'"`](\w+)[\'"`]', 'fetch_with_method'),
+            (r'fetch\s*\(\s*[\'"`]([^\'"` ]+)[\'"`]\s*\)', 'fetch_simple'),
+        ]
+
+        for pattern, ptype in fetch_patterns:
+            matches = re.finditer(pattern, script, re.DOTALL)
+            for match in matches:
+                if ptype == 'fetch_with_method':
+                    url = match.group(1)
+                    method = match.group(2).upper()
+                elif ptype == 'fetch_simple':
+                    url = match.group(1)
+                    method = 'GET'
+
+                api_calls.append({
+                    'url': url,
+                    'method': method,
+                    'type': 'fetch'
+                })
+
+        # Look for $http calls (if using older Vue patterns)
+        http_calls = re.finditer(r'\$http\.(get|post|put|patch|delete)\s*\(\s*[\'"`]([^\'"` ]+)[\'"`]', script)
+        for match in http_calls:
+            api_calls.append({
+                'url': match.group(2),
+                'method': match.group(1).upper(),
+                'type': '$http'
+            })
+
+        # Look for $api calls (custom API wrapper)
+        # this.$api.post('warehouse/cycle-count/...')
+        api_calls_match = re.finditer(r'\$api\.(get|post|put|patch|delete|head)\s*\(\s*[\'"`]([^\'"` ]+)[\'"`]', script)
+        for match in api_calls_match:
+            api_calls.append({
+                'url': match.group(2),
+                'method': match.group(1).upper(),
+                'type': '$api'
+            })
+
+        return api_calls
+
+    def _get_store_api_calls(self, script: str, component_file_path: str) -> List[Dict[str, str]]:
+        """Extract API calls from Vuex store actions that are actually dispatched.
+
+        Process:
+        1. Find store.dispatch() calls in component
+        2. Extract module name and action name
+        3. Find the store actions file
+        4. Parse ONLY the specific action that is dispatched
+        5. Extract API calls from that action only
+        """
+        api_calls = []
+        dispatched_actions = set()  # Track which actions are actually dispatched
+
+        try:
+            # Find store.dispatch() calls
+            # Pattern: store.dispatch('moduleName/actionName', payload)
+            # Pattern: store.dispatch(`${props.module}/actionName`, payload)
+            dispatch_patterns = [
+                r'store\.dispatch\s*\(\s*[\'"`]([^\'"`]+)/([^\'"`]+)[\'"`]',  # store.dispatch('module/action')
+                r'store\.dispatch\s*\(\s*`\$\{[^}]+\}/([^`]+)`',  # store.dispatch(`${module}/action`)
+            ]
+
+            for pattern in dispatch_patterns:
+                matches = re.finditer(pattern, script)
+                for match in matches:
+                    if len(match.groups()) == 2:
+                        module_name = match.group(1)
+                        action_name = match.group(2)
+                    else:
+                        # Dynamic module name - try to infer from props
+                        action_name = match.group(1)
+                        module_name = self._infer_store_module(script, component_file_path)
+
+                    if not module_name or not action_name:
+                        continue
+
+                    # Create unique key for this action
+                    action_key = f"{module_name}/{action_name}"
+
+                    # Only parse each action once per component
+                    if action_key in dispatched_actions:
+                        continue
+                    dispatched_actions.add(action_key)
+
+                    # Find and parse this specific store action
+                    store_api_calls = self._parse_store_action(module_name, action_name, component_file_path)
+                    api_calls.extend(store_api_calls)
+
+        except Exception as e:
+            # Silently fail - store parsing is optional
+            pass
+
+        return api_calls
+
+    def _infer_store_module(self, script: str, component_file_path: str) -> Optional[str]:
+        """Infer store module name from component file path or props."""
+        # Try to extract from file path
+        # e.g., views/pages/Warehouse/cycleCount/... -> Warehouse/cycleCount
+        path_parts = Path(component_file_path).parts
+
+        if 'Warehouse' in path_parts:
+            warehouse_index = path_parts.index('Warehouse')
+            # Get the next part after Warehouse
+            if warehouse_index + 1 < len(path_parts):
+                next_part = path_parts[warehouse_index + 1]
+                # Remove file extension
+                module_part = next_part.replace('.vue', '').replace('index', '')
+                if module_part:
+                    return f"Warehouse/{module_part}"
+
+        # Try to find module prop
+        # props: { module: { ... } }
+        # Then look for module: 'Warehouse/cycleCount'
+        module_match = re.search(r'module:\s*[\'"]([^\'"`]+)[\'"]', script)
+        if module_match:
+            return module_match.group(1)
+
+        return None
+
+    def _parse_store_action(self, module_name: str, action_name: str, component_file_path: str) -> List[Dict[str, str]]:
+        """Parse a Vuex store action file and extract API calls."""
+        api_calls = []
+
+        try:
+            # Find store directory from component path
+            # Component: .../resources/app/src/views/pages/Warehouse/...
+            # Store: .../resources/app/src/store/Warehouse/cycleCount/actions.js
+            parts = Path(component_file_path).parts
+            if 'src' in parts:
+                src_index = parts.index('src')
+                src_dir = Path(*parts[:src_index + 1])
+
+                # Build store actions path
+                # module_name could be 'Warehouse/cycleCount'
+                store_path = src_dir / 'store' / module_name / 'actions.js'
+
+                if not store_path.exists():
+                    return api_calls
+
+                # Read and parse actions file
+                with open(store_path, 'r', encoding='utf-8') as f:
+                    actions_content = f.read()
+
+                # Find the specific action function
+                # Pattern: async actionName({ commit }, payload) {
+                # Or: actionName(context, payload) {
+                action_pattern = rf'(?:async\s+)?{re.escape(action_name)}\s*\([^)]*\)\s*{{'
+                action_match = re.search(action_pattern, actions_content)
+
+                if not action_match:
+                    return api_calls
+
+                # The match includes the opening brace, so start after it
+                # Find where the opening { is in the match
+                opening_brace_pos = action_match.group().rfind('{')
+                start_pos = action_match.start() + opening_brace_pos + 1
+
+                # Find the closing brace for this action
+                brace_depth = 1
+                end_pos = start_pos
+
+                for i in range(start_pos, len(actions_content)):
+                    if actions_content[i] == '{':
+                        brace_depth += 1
+                    elif actions_content[i] == '}':
+                        brace_depth -= 1
+                        if brace_depth == 0:
+                            end_pos = i
+                            break
+
+                # Extract action body
+                action_body = actions_content[start_pos:end_pos]
+
+                # Extract API calls from action body
+                action_api_calls = self._detect_api_calls(action_body)
+                api_calls.extend(action_api_calls)
+
+        except Exception as e:
+            # Silently fail - store parsing is optional
+            pass
 
         return api_calls
 
